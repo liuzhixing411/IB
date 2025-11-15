@@ -1,194 +1,220 @@
-function pcc = Poisson(rho_cc, u_new, v_new, u_old, v_old, dx, dy, dt, ghostnum, f_x, f_y)
+function [u_new, v_new, p_new] = Poisson(Fluid, grid, u_star, v_star)
 
-[Ny, Nx] = size(rho_cc);
-start = ghostnum + 1;
-endy  = Ny - ghostnum;
-endx  = Nx - ghostnum;
-M = endy - start + 1;
-N = endx - start + 1;
-nCells = M * N;
+% 1. 完整实现变密度泊松方程 
+%    LHS: ∇ ⋅ ( (1/ρ) ∇p )
+%    RHS: (1/Δt) ∇ ⋅ u*
+% 2. 假设单位厚度 (h_depth = 1.0)
+% 3. 速度修正 u_new = u* - (Δt/ρ) ∇p
 
-% beta at cell centers
-beta_cc = 1 ./ rho_cc;
+% 0. 获取参数
+alpha = Fluid.alpha;
+rhol = Fluid.rhol; 
+rhog = Fluid.rhog; 
+p_old = Fluid.p;   
 
-% allocate assembly arrays
-I = zeros(5*nCells,1); J = I; S = I; ptr = 0;
-b = zeros(nCells,1);
+dt = grid.dt;
+h = grid.h;
+ghostnum = grid.ghostnum;
+Ny = grid.Ny;
+Nx = grid.Nx;
+start = grid.start;
+endy = grid.endy;
+endx = grid.endx;
 
-idx = @(jj,ii) (ii - start) * M + (jj - start) + 1;
+eps_div = 1e-12;
+h2 = h * h;
 
-small = 1e-14;
+% --- 1. 计算密度 (假设单位厚度) ---
+h_depth = 1.0; % [m]
 
-% -------------------- 对流项计算 --------------------
-adux = zeros(Ny+1,Nx+1); aduy = zeros(Ny+1,Nx+1);
-advx = zeros(Ny+1,Nx+1); advy = zeros(Ny+1,Nx+1);
 
-% u方向的对流加速度
+rho_cc_3D = rhol .* alpha + rhog .* (1 - alpha);
+
+rho_cc = rho_cc_3D * h_depth; 
+
+
+rhohalfx = zeros(Ny+1, Nx+1);
 for j=start:endy+1
     for i=start:endx+1
-        if(u_new(j,i)>0)
-            adux(j,i)=u_new(j,i)*(3*u_new(j,i)-4*u_new(j,i-1)+u_new(j,i-2))/(2*dx);
-        else
-            adux(j,i)=u_new(j,i)*(-3*u_new(j,i)+4*u_new(j,i+1)-u_new(j,i+2))/(2*dx);
-        end
-        
-        v_at_u_node = 0.25 * (v_new(j,i-1) + v_new(j,i) + v_new(j+1,i-1) + v_new(j+1,i));
-        if(v_at_u_node>0)
-            aduy(j,i)=v_at_u_node*(3*u_new(j,i)-4*u_new(j-1,i)+u_new(j-2,i))/(2*dy);
-        else
-            aduy(j,i)=v_at_u_node*(-3*u_new(j,i)+4*u_new(j+1,i)-u_new(j+2,i))/(2*dy);
-        end
+        rhohalfx(j,i) = (rho_cc(j,i) + rho_cc(j,i-1))/2;
     end
 end
-adu=adux+aduy;
 
-% v方向的对流加速度
+rhohalfy = zeros(Ny+1, Nx+1);
 for j=start:endy+1
     for i=start:endx+1
-        u_at_v_node = 0.25 * (u_new(j-1,i) + u_new(j-1,i+1) + u_new(j,i) + u_new(j,i+1));
-        % **修正：v的x方向导数应该除以dx**
-        if(u_at_v_node>0)
-            advx(j,i)=u_at_v_node*(3*v_new(j,i)-4*v_new(j,i-1)+v_new(j,i-2))/(2*dx);
-        else
-            advx(j,i)=u_at_v_node*(-3*v_new(j,i)+4*v_new(j,i+1)-v_new(j,i+2))/(2*dx);
-        end
+        rhohalfy(j,i) = (rho_cc(j,i) + rho_cc(j-1,i))/2;
+    end
+end
+
+% 2. 计算 RHS (Sval) 
+%  RHS = (1/Δt) ∇ ⋅ u*
+Sval = zeros(Ny, Nx);
+for j=start:endy
+    for i=start:endx
+        % div(u*) 在 cell center (j,i)
+        div_u_star = (u_star(j, i+1) - u_star(j, i))/h + ...
+                     (v_star(j+1, i) - v_star(j, i))/h;
         
-        if(v_new(j,i)>0)
-            advy(j,i)=v_new(j,i)*(3*v_new(j,i)-4*v_new(j-1,i)+v_new(j-2,i))/(2*dy);
-        else
-            advy(j,i)=v_new(j,i)*(-3*v_new(j,i)+4*v_new(j+1,i)-v_new(j+2,i))/(2*dy);
-        end
+        Sval(j,i) = (1.0 / dt) * div_u_star;
     end
 end
-adv=advx+advy;
 
-% -------------------- 对流加速度散度 div((u·∇)u) --------------------
-div_a_new = zeros(Ny,Nx);
+% --- 3. 迭代求解泊松方程 ∇ ⋅ ( (1/ρ) ∇p ) = Sval ---
+p_new = p_old; % 使用上一步压力作为初始猜测
+p_iter = p_old;
+max_iter = 5000; 
+tol = 1e-5;
 
-for j = start:endy
+for iter = 1:max_iter
+    p_prev_iter = p_iter;
+
+    % -------------------------
+    % 1) 在使用 p_iter 进行更新前，先为 p_iter 设置 ghost 值（基于 u_star, v_star）
+    % Left boundary (ghost i = start-1)
+    for j = start:endy
+        rho_face = rhohalfx(j, start);        
+        uface = u_star(j, start);             
+        p_iter(j, start-1) = p_iter(j, start) - h * (rho_face / dt) * (uface - 0); % u_b = 0
+    end
+    % Right boundary (ghost i = endx+1)
+    for j = start:endy
+        rho_face = rhohalfx(j, endx+1);
+        uface = u_star(j, endx+1);
+        p_iter(j, endx+1) = p_iter(j, endx) - h * (rho_face / dt) * (uface - 0);
+    end
+    % Bottom boundary (ghost j = start-1)
     for i = start:endx
-        % u方向对流加速度的x分量散度
-        dax_dx_new = (adu(j, i+1) - adu(j, i)) / dx;
-        % v方向对流加速度的y分量散度
-        day_dy_new = (adv(j+1, i) - adv(j, i)) / dy;
-        div_a_new(j,i) = dax_dx_new + day_dy_new;
+        rho_face = rhohalfy(start, i);
+        vface = v_star(start, i);
+        p_iter(start-1, i) = p_iter(start, i) - h * (rho_face / dt) * (vface - 0);
     end
-end
-
-% -------------------- 外力散度 div(f) --------------------
-div_f = zeros(Ny,Nx);
-for j = start:endy
+    % Top boundary (ghost j = endy+1)
     for i = start:endx
-        div_f(j,i) = (f_x(j, i+1) - f_x(j, i)) / dx + (f_y(j+1, i) - f_y(j, i)) / dy;
+        rho_face = rhohalfy(endy+1, i);
+        vface = v_star(endy+1, i);
+        p_iter(endy+1, i) = p_iter(endy, i) - h * (rho_face / dt) * (vface - 0);
+    end
+    % -------------------------
+    
+    % -------------------------
+    % 2) 用 p_iter（现在已含与 BC 一致的 ghost）计算 p_new（Jacobi 更新）
+    for j = start:endy
+        for i = start:endx
+            Ae = 1.0 / (rhohalfx(j, i+1) + eps_div);
+            Aw = 1.0 / (rhohalfx(j, i)   + eps_div);
+            An = 1.0 / (rhohalfy(j+1, i) + eps_div);
+            As = 1.0 / (rhohalfy(j, i)   + eps_div);
+            Ap = Ae + Aw + An + As;
+            p_new(j,i) = ( (Ae * p_iter(j,i+1) + Aw * p_iter(j,i-1)) + ...
+                           (An * p_iter(j+1,i) + As * p_iter(j-1,i)) - ...
+                           h2 * Sval(j,i) ) / Ap;
+        end
+    end
+    % -------------------------
+
+    % （可选）去掉压力平均值以消除纯 Neumann 导致的常数模
+    interior = p_new(start:endy, start:endx);
+    mean_p = mean(interior(:));
+    p_new(start:endy, start:endx) = interior - mean_p;
+
+    % 更新 p_iter，准备下一次迭代
+    p_iter = p_new;
+
+    % 计算收敛残差
+    res_norm = norm(p_iter(start:endy, start:endx) - p_prev_iter(start:endy, start:endx), 'fro');
+    p_norm = norm(p_iter(start:endy, start:endx), 'fro') + eps_div;
+    res = res_norm / p_norm;
+    if res < tol
+        break;
+    end
+end
+% 最终 p_new = p_iter;
+p_new = p_iter;
+
+% if iter == max_iter
+%     fprintf('Warning: Poisson did not converge. Res = %e\n', res);
+% end
+
+%  4. 速度修正
+% u_new = u_star - (Δt/ρ_face) * ∇p
+u_new = zeros(Ny+1, Nx+1);
+v_new = zeros(Ny+1, Nx+1);
+
+% u-velocity
+for j=start:endy+1 
+    for i=start+1:endx+1
+        grad_p_x = (p_new(j,i) - p_new(j,i-1)) / h;
+        % 使用 u-face 上的 2D 密度 rhohalfx
+        u_new(j,i) = u_star(j,i) - (dt / (rhohalfx(j,i) + eps_div)) * grad_p_x;
     end
 end
 
-% -------------------- 速度散度 (不可压缩性残差) --------------------
-divU_new = zeros(Ny,Nx);
-divU_old = zeros(Ny,Nx);
-for j = start:endy
-    for i = start:endx
-        divU_new(j,i) = (u_new(j, i+1) - u_new(j, i)) / dx + (v_new(j+1, i) - v_new(j, i)) / dy;
-        divU_old(j,i) = (u_old(j, i+1) - u_old(j, i)) / dx + (v_old(j+1, i) - v_old(j, i)) / dy;
+% v-velocity
+for j=start+1:endy+1 
+    for i=start:endx+1
+        grad_p_y = (p_new(j,i) - p_new(j-1,i)) / h;
+        % 使用 v-face 上的 2D 密度 rhohalfy
+        v_new(j,i) = v_star(j,i) - (dt / (rhohalfy(j,i) + eps_div)) * grad_p_y;
     end
 end
 
-% 时间导数项 dD/dt ≈ (divU_new - divU_old)/dt
-dD_dt = (divU_new - divU_old) / dt;
+% 5. 应用速度边界条件 (No-Slip Walls)
 
-% ---------------------------------------------------------------------
-% 组装矩阵 A (变系数) 和右端项 b = -div_a_new - dD_dt + div_f
-% ---------------------------------------------------------------------
-for j = start:endy
-    for i = start:endx
-        k = idx(j,i);
-
-        % 面上的调和平均beta (1/rho)
-        beta_e = 2 * beta_cc(j,i)   * beta_cc(j,i+1) / (beta_cc(j,i)   + beta_cc(j,i+1)   + small);
-        beta_w = 2 * beta_cc(j,i-1) * beta_cc(j,i)   / (beta_cc(j,i-1) + beta_cc(j,i)     + small);
-        beta_n = 2 * beta_cc(j+1,i) * beta_cc(j,i)   / (beta_cc(j+1,i) + beta_cc(j,i)     + small);
-        beta_s = 2 * beta_cc(j,i)   * beta_cc(j-1,i) / (beta_cc(j,i)   + beta_cc(j-1,i)   + small);
-
-        aE = beta_e / dx^2;
-        aW = beta_w / dx^2;
-        aN = beta_n / dy^2;
-        aS = beta_s / dy^2;
-
-        diagA = (aE + aW + aN + aS);
-
-        % 右端项 S = -div_a - dD_dt + div_f
-        Sval = - div_a_new(j,i) - dD_dt(j,i) + div_f(j,i);
-        b(k) = -Sval;
-
-        % West neighbor
-        if i-1 >= start
-            ptr = ptr + 1; I(ptr)=k; J(ptr)=idx(j,i-1); S(ptr)=-aW;
-        else
-            diagA = diagA - aW;
-        end
-
-        % East neighbor
-        if i+1 <= endx
-            ptr = ptr + 1; I(ptr)=k; J(ptr)=idx(j,i+1); S(ptr)=-aE;
-        else
-            diagA = diagA - aE;
-        end
-
-        % South neighbor
-        if j-1 >= start
-            ptr = ptr + 1; I(ptr)=k; J(ptr)=idx(j-1,i); S(ptr)=-aS;
-        else
-            diagA = diagA - aS;
-        end
-
-        % North neighbor
-        if j+1 <= endy
-            ptr = ptr + 1; I(ptr)=k; J(ptr)=idx(j+1,i); S(ptr)=-aN;
-        else
-            diagA = diagA - aN;
-        end
-
-        % diagonal
-        ptr = ptr + 1; I(ptr)=k; J(ptr)=k; S(ptr)=diagA;
+% left ghosts for u
+for j = 1:(Ny+1)
+    for i = 1:ghostnum
+        u_new(j,i) = - u_new(j, 2*ghostnum + 2 - i);
     end
 end
-
-% 形成稀疏矩阵
-I = I(1:ptr); J = J(1:ptr); S = S(1:ptr);
-A = sparse(I,J,S,nCells,nCells);
-
-% 固定参考压力 (中心点)
-ref_i = round((start+endx)/2);
-ref_j = round((start+endy)/2);
-ref_k = idx(ref_j, ref_i);
-A(ref_k, :) = 0;
-A(ref_k, ref_k) = 1;
-b(ref_k) = 0;
-
-% 求解
-pvec = A \ b;
-
-% 重塑为带ghost的pcc
-pcc = zeros(Ny, Nx);
-p_interior = reshape(pvec, M, N);
-pcc(start:endy, start:endx) = p_interior;
-
-% 镜像边界条件
+% right ghosts for u
+for j = 1:(Ny+1)
+    for i = endx+1:(Nx+1)
+        u_new(j,i) = - u_new(j, 2*endx + 2 - i);
+    end
+end
+% top ghosts for u
 for j = 1:ghostnum
-    mirror_j = 2*ghostnum + 1 - j;
-    pcc(j, :) = pcc(mirror_j, :);
+    for i = 1:(Nx+1)
+        u_new(j,i) = - u_new(2*ghostnum + 1 - j, i);
+    end
 end
-for j = endy+1:Ny
-    mirror_j = 2*endy + 1 - j;
-    pcc(j, :) = pcc(mirror_j, :);
+% bottom ghosts for u
+for j = endy+1:(Ny+1)
+    for i = 1:(Nx+1)
+        u_new(j,i) = - u_new(2*endy + 1 - j, i);
+    end
 end
-for i = 1:ghostnum
-    mirror_i = 2*ghostnum + 1 - i;
-    pcc(:, i) = pcc(:, mirror_i);
+% 壁面u速度设为0
+u_new(:, ghostnum+1) = 0;
+u_new(:, endx+1) = 0;
+
+% left ghosts for v
+for j = 1:(Ny+1)
+    for i = 1:ghostnum
+        v_new(j,i) = - v_new(j, 2*ghostnum + 1 - i);
+    end
 end
-for i = endx+1:Nx
-    mirror_i = 2*endx + 1 - i;
-    pcc(:, i) = pcc(:, mirror_i);
+% right ghosts for v
+for j=1:Ny+1
+    for i=endx+1:Nx+1
+        v_new(j,i) = - v_new(j,2*endx+1-i);
+    end
 end
+% top ghosts for v
+for j = 1:ghostnum
+    for i = 1:(Nx+1)
+        v_new(j,i) = - v_new(2*ghostnum + 2 - j, i);
+    end
+end
+% bottom ghosts for v
+for j = endy+1:(Ny+1)
+    for i = 1:(Nx+1)
+        v_new(j,i) = - v_new(2*endy + 2 - j, i);
+    end
+end
+% 壁面v速度设为0
+v_new(ghostnum+1, :) = 0;
+v_new(endy+1, :) = 0;
 
 end
