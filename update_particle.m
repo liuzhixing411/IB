@@ -1,80 +1,101 @@
-function Particle=update_particle(f_x,f_y,Particle,grid)
+function Particle=update_particle(f_x,f_y,Particle,Fluid,grid)
 % 更新粒子的平移和旋转运动
-% 根据论文 Eq.(28)-(33)
 
-g=9.8;
-dt=grid.dt;
-start=grid.start;
-endy=grid.endy;
-endx=grid.endx;
-h=grid.h;
+% m*dU/dt = ∮(τ ⋅ n_p) dA + (ρ_p - ρ_f) * V_p * g
+
+%  0. 获取参数
+
+rhol = Fluid.rhol; 
+rhog = Fluid.rhog; 
+alpha = Fluid.alpha;
+g_val = 9.8;
+dt = grid.dt;
+h = grid.h;
 ghostnum = grid.ghostnum;
 
 % 粒子参数
-u=Particle.u;
-v=Particle.v;
-omega=Particle.omega;
-m=Particle.m;
-x_c=Particle.x_c;
-y_c=Particle.y_c;
+rhos= Particle.rho;
 
-% 计算转动惯量 (2D圆盘)
+Vp_area = Particle.V;
+
+m = Particle.m;
+
 I = Particle.I;
 
-% 计算流体作用在粒子上的力和力矩
-% 根据论文 Eq.(28): F = -∫f dx (注意负号!)
-% 但是f已经是流体对粒子的作用力，所以粒子受到的力应该是-F
-% 实际上，在IBM中，f是施加在流体上使其满足边界条件的力
-% 根据牛顿第三定律，粒子受到的力是-f
+x_c = Particle.x_c;
+y_c = Particle.y_c;
 
-% 重新计算：
+%相互作用力
+
+rho_cc = rhol .* alpha + rhog .* (1 - alpha);
+% 网格单元的体积 dV
+dV = h * h ; 
+
 Fx = 0;
 Fy = 0;
 Torque = 0;
 
-for j=start:endy+1
-    for i=start:endx+1
-        % u-face: 贡献f_x和相应的力矩
-        if i >= start && i <= endx+1
+for j=grid.start:grid.endy+1
+    for i=grid.start:grid.endx+1
+        
+        % u-face (j, i)
+        if i >= grid.start && i <= grid.endx+1
             
-            y_u = (j - ghostnum -0.5) * h;
-            Fx = Fx - f_x(j,i) * h^2;
-            % 力矩：r × F，2D中T_z = r_x * F_y - r_y * F_x
-            % 但f_x在u-face上，我们需要v的分量来计算力矩
-            % 简化：只使用y方向的力矩贡献
-            Torque = Torque + (y_u - y_c) * f_x(j,i) * h^2;
+            rho_face_u_3D = (rho_cc(j,i) + rho_cc(j,i-1))/2;
+            y_u = (j - ghostnum - 0.5) * h;            
+            Fx_contrib = - (rho_face_u_3D * f_x(j,i) * dV);
+            Fx = Fx + Fx_contrib;
+            Torque = Torque - (y_u - y_c) * Fx_contrib; 
         end
         
-        % v-face: 贡献f_y和相应的力矩  
-        if j >= start && j <= endy+1
-            x_v = (i - ghostnum -0.5) * h;
+        % v-face (j, i)
+        if j >= grid.start && j <= grid.endy+1
             
-            Fy = Fy - f_y(j,i) * h^2;
-            % 力矩：r × F
-            Torque = Torque - (x_v - x_c) * f_y(j,i) * h^2;
+            rho_face_v_3D = (rho_cc(j,i) + rho_cc(j-1,i))/2;
+            x_v = (i - ghostnum - 0.5) * h;
+            Fy_contrib = - (rho_face_v_3D * f_y(j,i) * dV);
+            Fy = Fy + Fy_contrib;
+            Torque = Torque + (x_v - x_c) * Fy_contrib;
         end
     end
 end
 
-% 更新速度和角速度 - 根据论文 Eq.(30) 和 Eq.(32)
-% dU/dt = F/M + g
-% dω/dt = T/I
+% 3. 计算净浮力
+% (ρ_p - ρ_f) * V_p * g 
 
-u_new = u + (Fx/m) * dt;
-v_new = v + (Fy/m - g) * dt;  % 重力向下
-omega_new = omega + (Torque/I) * dt;
+% 粒子体积 V_p
+Vp_volume = Vp_area; 
+rho_f_local_3D = Fluid.rhol; 
+F_buoyancy_y = (rhos - rho_f_local_3D) * Vp_volume * (-g_val);
+F_buoyancy_x = 0; % 假设重力只在y方向
+
+% 4. 更新运动
+% m*dU/dt = F_hydro + F_buoyancy
+
+% 粒子质量 m
+m_particle = m ; % [kg]
+% 粒子转动惯量 I
+I_particle = I ; % [kg*m^2]
+% (检查: I_init = 0.5*m*r^2 = 0.5*(m_particle/h_depth)*r^2 = I_particle/(h_depth*2) * r^2 ... 
 
 
-% 更新位置和角度 - 根据论文 Eq.(31) 和 Eq.(33)
-% dX/dt = U (使用中点法或显式Euler)
-x_c_new = x_c + 0.5*(u + u_new) * dt;
-y_c_new = y_c + 0.5*(v + v_new) * dt;
+% 总力
+F_total_x = Fx + F_buoyancy_x;
+F_total_y = Fy + F_buoyancy_y;
 
-% 更新粒子结构体
+% 更新速度 (一步欧拉法)
+u_new = Particle.u + (F_total_x / m_particle) * dt;
+v_new = Particle.v + (F_total_y / m_particle) * dt;
+omega_new = Particle.omega + (Torque / I_particle) * dt;
+
+% 更新位置
+x_c_new = x_c + u_new * dt;
+y_c_new = y_c + v_new * dt;
+
+%  5. 赋值 
 Particle.u = u_new;
 Particle.v = v_new;
 Particle.omega = omega_new;
 Particle.x_c = x_c_new;
 Particle.y_c = y_c_new;
-
 end
